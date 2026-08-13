@@ -1,0 +1,129 @@
+module sh.sysl.zephyr
+
+@include("zephyr/autoconf.h")
+@include("zephyr/kernel.h")
+
+import sysl.slices.as_mut_ptr
+
+// Work items: a function to run later, on somebody else's thread.
+//
+// **The answer to "my interrupt handler needs to do something that blocks".** A handler cannot take
+// a mutex, allocate, or wait -- but it can submit a work item, and the system work queue's thread
+// runs it in thread context a moment later, where all three are legal. That is the standard Zephyr
+// shape and it costs one object per piece of work.
+//
+// A work item is **not** re-entrant and does not queue twice: submitting one that is already pending
+// does nothing and answers so. It is a promise that the function will run soon, not a count of how
+// many times it was asked for.
+//
+// The handler is a `*extern(*u8) -> unit` handed the work item's own storage, which is what lets one
+// handler serve several items and how it tells them apart.
+
+// What the kernel calls a work item, and a delayable one. Only ever held by pointer.
+opaque struct WorkControl
+opaque struct DelayableControl
+
+/** How many `long`s each kind of work item needs. */
+c const
+    work_words: usize      = "(sizeof(struct k_work) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+    delayable_words: usize = "(sizeof(struct k_work_delayable) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+
+private[zephyr] c const
+    work_align: usize      = "__alignof__(struct k_work)"
+    delayable_align: usize = "__alignof__(struct k_work_delayable)"
+
+@assert(alignof(long) >= work_align,
+        "a 'struct k_work' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+@assert(alignof(long) >= delayable_align,
+        "a 'struct k_work_delayable' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+// A function to run on the system work queue.
+struct Work
+    private[zephyr] handle: *WorkControl
+
+    /** Ask for it to run. `false` if it was already waiting to, which is not an error.
+     *
+     * Safe from an interrupt handler, which is what this is for.
+     */
+    submit(self) -> bool = c_work_submit(self.handle) == 1
+
+    /** Whether it is waiting to run or running now. */
+    pending -> bool = c_work_is_pending(self.handle)
+
+    /** Take it off the queue if it has not started. It does **not** stop one already running. */
+    cancel(self) -> bool = c_work_cancel(self.handle) == 0
+end Work
+
+// The same, with a delay: the kernel waits before queueing it.
+//
+// This is the "do it in 50 ms unless something happens first" primitive -- a debounce, a retry, a
+// timeout on an operation that has no timeout of its own.
+struct DelayableWork
+    private[zephyr] handle: *DelayableControl
+
+    /** Queue it after `t`, unless it is already scheduled -- in which case the earlier time stands. */
+    schedule(self, t: Timeout) -> bool = c_work_schedule(self.handle, t.raw) >= 0
+
+    /** Queue it after `t`, replacing any time already set. The debounce.
+     *
+     * A key pressed again before the delay ran out pushes the delay back out to the full `t`, which
+     * is exactly what `schedule` does not do.
+     */
+    reschedule(self, t: Timeout) -> bool = c_work_reschedule(self.handle, t.raw) >= 0
+
+    pending -> bool = c_work_delayable_is_pending(self.handle)
+
+    /** Cancel it if it has not run yet. */
+    cancel(self) -> bool = c_work_cancel_delayable(self.handle) == 0
+end DelayableWork
+
+/** A work item in storage you own, calling `handler` on the system work queue.
+ *
+ * `handler` takes the item's own control block, so one function can serve several items. Write
+ * `&handler` rather than `handler` -- a bare name is a closure and has no address.
+ */
+work(storage: []long, handler: *extern(*u8) -> unit) -> Option[Work]
+    if storage.len < work_words then return None
+
+    val h: *WorkControl = ptr_cast(as_mut_ptr(storage))
+
+    c_work_init(h, handler)
+
+    Some(Work(h))
+end work
+
+/** A delayable work item in storage you own. Storage is `delayable_words` rather than `work_words`. */
+delayable_work(storage: []long, handler: *extern(*u8) -> unit) -> Option[DelayableWork]
+    if storage.len < delayable_words then return None
+
+    val h: *DelayableControl = ptr_cast(as_mut_ptr(storage))
+
+    c_work_init_delayable(h, handler)
+
+    Some(DelayableWork(h))
+end delayable_work
+
+/** The delayable item a handler was called for, given the `k_work` it was handed.
+ *
+ * A delayable item's handler is called with the plain work item *inside* it, so a handler that wants
+ * to reschedule itself has to get back out. In C that is `k_work_delayable_from_work`, which is a
+ * pointer subtraction rather than a function -- this is the one way to reach it from sysl.
+ */
+delayable_of(work: *u8) -> DelayableWork = DelayableWork(ptr_cast(c_delayable_from_work(work)))
+
+private[zephyr] extern "syslZephyrWorkInit" c_work_init(w: *WorkControl,
+                                                        handler: *extern(*u8) -> unit)
+
+private[zephyr] extern "syslZephyrWorkSubmit" c_work_submit(w: *WorkControl) -> int
+private[zephyr] extern "syslZephyrWorkCancel" c_work_cancel(w: *WorkControl) -> int
+private[zephyr] extern "syslZephyrWorkIsPending" c_work_is_pending(w: *WorkControl) -> bool
+
+private[zephyr] extern "syslZephyrWorkInitDelayable" c_work_init_delayable(w: *DelayableControl,
+                                                                          handler: *extern(*u8) -> unit)
+
+private[zephyr] extern "syslZephyrWorkSchedule" c_work_schedule(w: *DelayableControl, ticks: long) -> int
+private[zephyr] extern "syslZephyrWorkReschedule" c_work_reschedule(w: *DelayableControl, ticks: long) -> int
+private[zephyr] extern "syslZephyrWorkCancelDelayable" c_work_cancel_delayable(w: *DelayableControl) -> int
+private[zephyr] extern "syslZephyrWorkDelayableIsPending" c_work_delayable_is_pending(w: *DelayableControl) -> bool
+private[zephyr] extern "syslZephyrDelayableFromWork" c_delayable_from_work(w: *u8) -> *u8

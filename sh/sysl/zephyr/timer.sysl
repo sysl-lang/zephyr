@@ -1,0 +1,108 @@
+module sh.sysl.zephyr
+
+@include("zephyr/autoconf.h")
+@include("zephyr/kernel.h")
+
+import sysl.slices.as_mut_ptr
+
+// Timers: a callback after a delay, once or over and over.
+//
+// **The expiry function runs in interrupt context**, on the system clock's own handler, and that is
+// the whole of what makes timers different from everything else here. Nothing in it may block: no
+// `take(forever())`, no `lock`, no allocation. What it may do is `give` a semaphore or `post` an
+// event, which is how the work gets to a thread.
+//
+// A timer that only needs to wake a thread does not need a callback at all -- `status_sync` blocks
+// until the next expiry, and a periodic timer plus one thread sitting in `status_sync` is a
+// complete "do this every 20 ms" without any interrupt-context code.
+
+// What the kernel calls a timer. Only ever held by pointer.
+opaque struct TimerControl
+
+/** How many `long`s a timer's storage needs. */
+c const
+    timer_words: usize = "(sizeof(struct k_timer) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+
+private[zephyr] c const
+    timer_align: usize = "__alignof__(struct k_timer)"
+
+@assert(alignof(long) >= timer_align,
+        "a 'struct k_timer' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+// A one-shot or periodic timer.
+struct Timer
+    private[zephyr] handle: *TimerControl
+
+    /** Start it: first expiry after `duration`, then every `period`.
+     *
+     * `period` of `no_wait()` makes it one-shot. Starting a timer that is already running restarts
+     * it rather than stacking, so this is also how a watchdog is fed.
+     */
+    start(self, duration: Timeout, period: Timeout) = c_timer_start(self.handle, duration.raw, period.raw)
+
+    /** Stop it. The stop function, if it has one, runs; the expiry function does not. */
+    stop(self) = c_timer_stop(self.handle)
+
+    /** How many times it has expired since this was last asked, and zero the count. */
+    status(self) -> u32 = c_timer_status_get(self.handle)
+
+    /** Wait for the next expiry, answering how many happened.
+     *
+     * The blocking half of `status`, and the reason a timer needs no callback: a thread that sits
+     * here does the periodic work itself, in thread context, where it may block. If expiries were
+     * already pending it returns at once with their count -- so a thread that fell behind learns by
+     * how much rather than silently skipping.
+     */
+    wait(self) -> u32 = c_timer_status_sync(self.handle)
+
+    /** Ticks until the next expiry, zero if it is not running. */
+    remaining -> long = c_timer_remaining(self.handle)
+end Timer
+
+/** A timer in storage you own, with no callbacks -- for a thread that waits on it with `wait`. */
+timer(storage: []long) -> Option[Timer]
+    if storage.len < timer_words then return None
+
+    val h: *TimerControl = ptr_cast(as_mut_ptr(storage))
+
+    c_timer_init(h, null, null)
+
+    Some(Timer(h))
+end timer
+
+/** A timer that calls `on_expiry` **in interrupt context** every time it expires.
+ *
+ * The callback is a `*extern(*u8) -> unit` and is handed the timer's own control block, which is
+ * what lets one function serve several timers. Write `&handler`, not `handler`.
+ *
+ * `on_stop` runs when the timer is stopped early, in whatever context called `stop`. Pass `null`
+ * for either that is not wanted.
+ */
+timer_with(storage: []long, on_expiry: *extern(*u8) -> unit,
+           on_stop: *extern(*u8) -> unit) -> Option[Timer]
+    if storage.len < timer_words then return None
+
+    val h: *TimerControl = ptr_cast(as_mut_ptr(storage))
+
+    c_timer_init(h, on_expiry, on_stop)
+
+    Some(Timer(h))
+end timer_with
+
+/** A view of the timer already in this storage, for another thread. See `semaphore_at`. */
+timer_at(storage: []long) -> Option[Timer]
+    if storage.len < timer_words then return None
+
+    Some(Timer(ptr_cast(as_mut_ptr(storage))))
+
+private[zephyr] extern "syslZephyrTimerInit" c_timer_init(t: *TimerControl,
+                                                          expiry: *extern(*u8) -> unit,
+                                                          stop: *extern(*u8) -> unit)
+
+private[zephyr] extern "syslZephyrTimerStart" c_timer_start(t: *TimerControl, duration: long,
+                                                            period: long)
+
+private[zephyr] extern "syslZephyrTimerStop" c_timer_stop(t: *TimerControl)
+private[zephyr] extern "syslZephyrTimerStatusGet" c_timer_status_get(t: *TimerControl) -> u32
+private[zephyr] extern "syslZephyrTimerStatusSync" c_timer_status_sync(t: *TimerControl) -> u32
+private[zephyr] extern "syslZephyrTimerRemainingTicks" c_timer_remaining(t: *TimerControl) -> long

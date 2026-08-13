@@ -1,0 +1,91 @@
+module sh.sysl.zephyr
+
+@include("zephyr/autoconf.h")
+@include("zephyr/kernel.h")
+
+import sysl.slices.as_mut_ptr
+
+// Events: thirty-two bits a thread can wait on, one or all at a time.
+//
+// The thing a semaphore cannot do. A semaphore counts one kind of thing; an event object carries a
+// set of independent flags, and a thread can wait for *any* of a mask or for *all* of it. That is
+// the shape of nearly every "wait until the radio is up and the card is mounted" problem, and doing
+// it with semaphores means one per condition and a thread that can only wait on one.
+//
+// **Posting is safe from an interrupt handler and never blocks**, which is the other half of why
+// this exists: a handler sets a bit, and whichever threads were waiting on it wake.
+
+// What the kernel calls an event object. Only ever held by pointer.
+opaque struct EventControl
+
+/** How many `long`s an event object's storage needs. */
+c const
+    event_words: usize = "(sizeof(struct k_event) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+
+private[zephyr] c const
+    event_align: usize = "__alignof__(struct k_event)"
+
+@assert(alignof(long) >= event_align,
+        "a 'struct k_event' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+// A set of thirty-two flags threads can wait on.
+struct Event
+    private[zephyr] handle: *EventControl
+
+    /** Set these bits, leaving the others alone, and answer the whole set as it now stands. */
+    post(self, bits: u32) -> u32 = c_event_post(self.handle, bits)
+
+    /** Set the whole set to exactly these bits, clearing every other one. */
+    set(self, bits: u32) -> u32 = c_event_set(self.handle, bits)
+
+    /** Clear these bits, answering the set as it was **before**. */
+    clear(self, bits: u32) -> u32 = c_event_clear(self.handle, bits)
+
+    /** Which of these bits are set right now, without waiting. */
+    test(self, mask: u32) -> u32 = c_event_test(self.handle, mask)
+
+    /** Wait until **any** of `bits` is set, answering the ones that were. Zero means the wait ran out.
+     *
+     * `reset` clears the whole set before waiting, which is what a thread wants when it is starting a
+     * fresh round and does not care what happened before it got here.
+     */
+    wait_any(self, bits: u32, reset: bool, t: Timeout) -> u32 =
+        c_event_wait(self.handle, bits, reset, t.raw)
+
+    /** Wait until **all** of `bits` are set. Zero means the wait ran out with some still missing.
+     *
+     * The bits need not arrive together: the kernel remembers them, so two handlers posting one bit
+     * each, a second apart, wake this exactly once.
+     */
+    wait_all(self, bits: u32, reset: bool, t: Timeout) -> u32 =
+        c_event_wait_all(self.handle, bits, reset, t.raw)
+end Event
+
+/** An event object in storage you own, starting with no bits set. */
+event(storage: []long) -> Option[Event]
+    if storage.len < event_words then return None
+
+    val h: *EventControl = ptr_cast(as_mut_ptr(storage))
+
+    c_event_init(h)
+
+    Some(Event(h))
+end event
+
+/** A view of the event object already in this storage, for another thread. See `semaphore_at`. */
+event_at(storage: []long) -> Option[Event]
+    if storage.len < event_words then return None
+
+    Some(Event(ptr_cast(as_mut_ptr(storage))))
+
+private[zephyr] extern "syslZephyrEventInit" c_event_init(e: *EventControl)
+private[zephyr] extern "syslZephyrEventPost" c_event_post(e: *EventControl, bits: u32) -> u32
+private[zephyr] extern "syslZephyrEventSet" c_event_set(e: *EventControl, bits: u32) -> u32
+private[zephyr] extern "syslZephyrEventClear" c_event_clear(e: *EventControl, bits: u32) -> u32
+private[zephyr] extern "syslZephyrEventTest" c_event_test(e: *EventControl, mask: u32) -> u32
+
+private[zephyr] extern "syslZephyrEventWait" c_event_wait(e: *EventControl, bits: u32, reset: bool,
+                                                          ticks: long) -> u32
+
+private[zephyr] extern "syslZephyrEventWaitAll" c_event_wait_all(e: *EventControl, bits: u32,
+                                                                 reset: bool, ticks: long) -> u32

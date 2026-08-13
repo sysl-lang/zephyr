@@ -1,0 +1,179 @@
+module sh.sysl.zephyr
+
+@include("zephyr/autoconf.h")
+@include("zephyr/kernel.h")
+
+import sysl.slices.{as_mut_ptr, as_ptr}
+
+// Threads, and the stacks they run on.
+//
+// **A thread needs two pieces of storage you own** -- the control block and the stack -- and neither
+// can be allocated, because a kernel object is caller storage in Zephyr. The control block is sized
+// the same way every other object here is:
+//
+//     var control: [thread_words]long = [0; thread_words]
+//
+// **The stack is the one thing this package cannot size for you**, and the reason is worth reading
+// once. How many bytes a stack of a given size actually occupies, and what it must be aligned to,
+// are macros over the architecture and over the MPU configuration -- `K_KERNEL_STACK_LEN(1024)` is
+// 1024 on one board and rather more on another, and an MPU board may want the object aligned to its
+// own size. A sysl array length is a compile-time constant, so the measurement has to happen in the
+// module that declares the array:
+//
+//     @include("zephyr/autoconf.h")
+//     @include("zephyr/kernel.h")
+//
+//     c const
+//         worker_stack_bytes: usize = "K_KERNEL_STACK_LEN(1024)"
+//
+//     @align(stack_align)
+//     var worker_stack: [worker_stack_bytes]u8 = [0; worker_stack_bytes]
+//
+// That is `K_KERNEL_STACK_DEFINE` written out, and it is what that macro does. Get the alignment
+// wrong and the kernel either faults on the first context switch or -- on a board with an MPU --
+// refuses the thread.
+//
+// **Both pieces must outlive the thread**, which means module storage. A control block in a frame
+// that returns is a scheduler walking freed memory.
+//
+// A word about what may cross into one: `06`'s rules are the language's and a Zephyr thread is an
+// ordinary domain. A plain `&T` may not go, because its count is not atomic; `&sync T` may. Nothing
+// in this package relaxes that, and nothing in it can.
+
+// What the kernel calls a thread. Only ever held by pointer; `k_tid_t` is exactly this.
+opaque struct ThreadControl
+
+/** How many `long`s a thread's control block needs, and what a stack must be aligned to. */
+c const
+    thread_words: usize = "(sizeof(struct k_thread) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+    stack_align: usize  = "Z_KERNEL_STACK_OBJ_ALIGN"
+
+private[zephyr] c const
+    thread_align: usize = "__alignof__(struct k_thread)"
+
+@assert(alignof(long) >= thread_align,
+        "a 'struct k_thread' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+/** The options a thread can be created with, which are bits rather than a choice.
+ *
+ * `essential` says the system cannot run without this thread, so the kernel panics rather than
+ * carrying on if it exits. `float_regs` gives it the floating-point registers, which on a board with
+ * an FPU it does not otherwise get -- a thread that does floating-point arithmetic without it
+ * corrupts another thread's registers, quietly.
+ */
+c const
+    no_options: u32  = "0"
+    essential: u32   = "K_ESSENTIAL"
+    float_regs: u32  = "K_FP_REGS"
+
+/** The highest and lowest priority a thread can be given.
+ *
+ * **Lower numbers run first**, which is the opposite of most kernels. Negative priorities are
+ * *cooperative*: such a thread runs until it blocks or yields and is never preempted by another
+ * thread. Zero and above are preemptible.
+ */
+c const
+    highest_priority: int = "-CONFIG_NUM_COOP_PRIORITIES"
+    lowest_priority: int  = "CONFIG_NUM_PREEMPT_PRIORITIES - 1"
+
+// A running -- or not yet started -- thread.
+//
+// It is a handle rather than the thread's storage: copying one is copying a pointer, and two copies
+// name the same thread.
+struct Thread
+    private[zephyr] handle: *ThreadControl
+
+    /** Start a thread that was created with a delay of `forever()`. */
+    start(self) = c_thread_start(self.handle)
+
+    /** End the thread, wherever it is.
+     *
+     * It stops at once, holding whatever it was holding -- a mutex it had locked is *not* released,
+     * and a thread waiting on that mutex waits for good. Aborting a thread that is doing something
+     * is nearly always the wrong tool; ask it to stop and let it return instead.
+     */
+    abort(self) = c_thread_abort(self.handle)
+
+    /** Take the thread off the run queue until `resume`. A thread may suspend itself. */
+    suspend(self) = c_thread_suspend(self.handle)
+
+    /** Put it back on. Does nothing to a thread that is not suspended. */
+    resume(self) = c_thread_resume(self.handle)
+
+    /** Cut short a `sleep` this thread is in, which is what makes `sleep` answer non-zero. */
+    wakeup(self) = c_thread_wakeup(self.handle)
+
+    /** Wait for the thread to end, `false` if the wait ran out first.
+     *
+     * Needs the thread to have been created, and answers immediately for one that has already
+     * finished. It is how a program knows a worker is done rather than guessing with a sleep.
+     */
+    join(self, t: Timeout) -> bool = c_thread_join(self.handle, t.raw) == 0
+
+    /** Its priority. Lower runs first; negative is cooperative. */
+    priority -> int = c_thread_priority_get(self.handle)
+
+    /** Change it, which may cause a context switch right here if it lowers this thread's own. */
+    set_priority(self, prio: int) = c_thread_priority_set(self.handle, prio)
+end Thread
+
+/** Create a thread and start it, with nothing passed in.
+ *
+ * The short form of `thread` for the common case: a worker that reads what it needs from module
+ * storage. `control` is `thread_words` of `long`, `stack` is the array the module measured with
+ * `K_KERNEL_STACK_LEN`, and both must outlive the thread.
+ *
+ * **The body is a `*extern(*u8, *u8, *u8) -> unit` rather than a bare arrow**, because a Zephyr
+ * thread entry is a C function pointer and a closure has no address. Write `&worker`, not `worker` --
+ * the bare name is the capture-free closure and the compiler will say so.
+ *
+ * `None` where either piece of storage is too small.
+ */
+spawn(control: []long, stack: []u8, body: *extern(*u8, *u8, *u8) -> unit,
+      prio: int) -> Option[Thread] =
+    thread(control, stack, body, null, null, null, prio, no_wait(), no_options)
+
+/** Create a thread, in full: three arguments, a start delay and the option bits.
+ *
+ * `delay` of `no_wait()` starts it immediately -- and it may run before this call returns, if its
+ * priority is higher than the caller's. `forever()` creates it stopped, for `start` to release
+ * later.
+ *
+ * The three `*u8` arguments are the kernel's own `void *` parameters and are passed through
+ * untouched. **They are the one hole in the language's crossing rules that this package cannot
+ * close**, exactly as the same three are in FreeRTOS: a pointer cast to `*u8` has lost the type that
+ * would have told the compiler whether it was safe to share.
+ *
+ * `None` where either piece of storage is too small.
+ */
+thread(control: []long, stack: []u8, body: *extern(*u8, *u8, *u8) -> unit,
+       p1: *u8, p2: *u8, p3: *u8, prio: int, delay: Timeout, options: u32) -> Option[Thread]
+    if control.len < thread_words || stack.len == 0 then return None
+
+    val h: *ThreadControl = ptr_cast(as_mut_ptr(control))
+
+    val tid = c_thread_create(h, as_mut_ptr(stack), stack.len, body, p1, p2, p3,
+                              prio, options, delay.raw)
+
+    if tid == null then None else Some(Thread(tid))
+end thread
+
+/** The thread that is running now. Undefined before the kernel starts and in an interrupt handler. */
+current() -> Thread = Thread(c_current_get())
+
+private[zephyr] extern "syslZephyrThreadCreate" c_thread_create(control: *ThreadControl, stack: *u8,
+                                                                stack_size: usize,
+                                                                body: *extern(*u8, *u8, *u8) -> unit,
+                                                                p1: *u8, p2: *u8, p3: *u8,
+                                                                prio: int, options: u32,
+                                                                delay: long) -> *ThreadControl
+
+private[zephyr] extern "syslZephyrThreadStart" c_thread_start(t: *ThreadControl)
+private[zephyr] extern "syslZephyrThreadAbort" c_thread_abort(t: *ThreadControl)
+private[zephyr] extern "syslZephyrThreadSuspend" c_thread_suspend(t: *ThreadControl)
+private[zephyr] extern "syslZephyrThreadResume" c_thread_resume(t: *ThreadControl)
+private[zephyr] extern "syslZephyrThreadWakeup" c_thread_wakeup(t: *ThreadControl)
+private[zephyr] extern "syslZephyrThreadJoin" c_thread_join(t: *ThreadControl, ticks: long) -> int
+private[zephyr] extern "syslZephyrThreadPriorityGet" c_thread_priority_get(t: *ThreadControl) -> int
+private[zephyr] extern "syslZephyrThreadPrioritySet" c_thread_priority_set(t: *ThreadControl, prio: int)
+private[zephyr] extern "syslZephyrCurrentGet" c_current_get() -> *ThreadControl

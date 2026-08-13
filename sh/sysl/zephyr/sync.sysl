@@ -1,0 +1,227 @@
+module sh.sysl.zephyr
+
+@include("zephyr/autoconf.h")
+@include("zephyr/kernel.h")
+
+import sysl.slices.as_mut_ptr
+
+// Semaphores, mutexes and condition variables.
+//
+// **Every kernel object in Zephyr is storage the caller owns**, which is the single largest
+// difference from a kernel that hands back a handle. `struct k_sem` is a real struct that lives
+// wherever you put it -- there is no allocation, nothing to fail, and nothing to free. That is what
+// makes Zephyr usable with `CONFIG_HEAP_MEM_POOL_SIZE=0`, and it is why every constructor here takes
+// a slice of storage rather than answering one.
+//
+// The storage is spelled `[]long` and sized by a `c const` this package measures out of your
+// headers:
+//
+//     var storage: [sem_words]long = [0; sem_words]
+//
+//     val sem = semaphore(storage, 0, 1).unwrap
+//
+// **`long` rather than `usize`, and that is load bearing.** A kernel object holds a `_timeout` with
+// an `int64_t` in it under the default `CONFIG_TIMEOUT_64BIT`, so it wants eight-byte alignment even
+// on a 32-bit machine -- which an array of 32-bit words would not give it. An array of `long` is
+// eight-byte aligned everywhere, and the `@assert`s below check that against the alignment the C
+// compiler reports rather than trusting the argument.
+//
+// **The storage must outlive the object**, which in practice means it is module storage or it is a
+// local in a function that never returns. A kernel object in a frame that goes away is a thread
+// blocking on freed memory, and nothing will say so.
+
+// What the kernel calls a semaphore. Only ever held by pointer.
+opaque struct SemControl
+
+// The same, for the two lock flavours. They are three types rather than one because they are three
+// objects: passing a condition variable's storage to `mutex` would compile if they shared a type.
+opaque struct MutexControl
+opaque struct CondvarControl
+
+/** How many `long`s of storage each object needs, measured out of your kernel's headers. */
+c const
+    sem_words: usize     = "(sizeof(struct k_sem) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+    mutex_words: usize   = "(sizeof(struct k_mutex) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+    condvar_words: usize = "(sizeof(struct k_condvar) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+
+// What the C compiler says each object must be aligned to. Read separately rather than assumed,
+// because it moves with the architecture and with half a dozen Kconfig options.
+private[zephyr] c const
+    sem_align: usize     = "__alignof__(struct k_sem)"
+    mutex_align: usize   = "__alignof__(struct k_mutex)"
+    condvar_align: usize = "__alignof__(struct k_condvar)"
+
+// An array of `long` is aligned to `alignof(long)`, and every constructor here lays a kernel object
+// into one. A configuration whose objects want more than that would be laid out at the wrong address
+// and the failure would be a fault far from the cause, so it is refused here instead.
+@assert(alignof(long) >= sem_align,
+        "a 'struct k_sem' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+@assert(alignof(long) >= mutex_align,
+        "a 'struct k_mutex' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+@assert(alignof(long) >= condvar_align,
+        "a 'struct k_condvar' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+// A counting or binary semaphore: a number that `give` raises and `take` lowers, and a thread that
+// takes one at zero waits.
+struct Semaphore
+    private[zephyr] handle: *SemControl
+
+    /** Take one, waiting up to `t` for there to be one. `false` means the wait ran out.
+     *
+     * `no_wait()` never blocks and is the only timeout an interrupt handler may pass; `forever()`
+     * blocks until somebody gives.
+     */
+    take(self, t: Timeout) -> bool = c_sem_take(self.handle, t.raw) == 0
+
+    /** Give one back.
+     *
+     * A semaphore already at its limit stays there -- the give is dropped rather than counted, which
+     * is the difference between a counting semaphore at its maximum and one that has room. It is
+     * safe from an interrupt handler, and that is what a semaphore is mostly for.
+     */
+    give(self) = c_sem_give(self.handle)
+
+    /** Set the count back to zero, releasing nobody. */
+    reset(self) = c_sem_reset(self.handle)
+
+    /** The count, which for a binary semaphore is 0 or 1. */
+    count -> uint = c_sem_count(self.handle)
+end Semaphore
+
+// A mutex: a lock with an owner and priority inheritance.
+//
+// The owner matters. A mutex may be unlocked only by the thread that locked it, and while a
+// higher-priority thread waits the kernel raises the holder to that priority so the mutex is
+// released promptly -- which is what makes a mutex rather than a binary semaphore the right thing
+// for guarding data between threads of different priorities.
+//
+// **It is not for an interrupt handler.** Priority inheritance is meaningless where there is no
+// thread to inherit to, and `lock` blocks. A handler that needs to signal wants a semaphore.
+struct Mutex
+    private[zephyr] handle: *MutexControl
+
+    /** Take the mutex, waiting up to `t`. `false` means somebody else still holds it.
+     *
+     * **It is recursive**, which is a real difference from most kernels: a thread that locks a mutex
+     * it already holds succeeds and raises a count, and must unlock as many times as it locked.
+     */
+    lock(self, t: Timeout) -> bool = c_mutex_lock(self.handle, t.raw) == 0
+
+    /** Give back one acquisition. `false` if this thread is not the holder, which is a bug rather
+     * than a condition. */
+    unlock(self) -> bool = c_mutex_unlock(self.handle) == 0
+end Mutex
+
+// A condition variable: a place for a thread to wait until another says something changed.
+//
+// Always used with a mutex, and always in a loop, because a wakeup does not prove the condition
+// holds -- `broadcast` wakes every waiter and only one of them can win a race for the data:
+//
+//     lock.lock(forever())
+//
+//     while !ready
+//         cv.wait(lock, forever())
+//
+//     ...
+//     lock.unlock()
+struct Condvar
+    private[zephyr] handle: *CondvarControl
+
+    /** Release the mutex, wait to be signalled, and take the mutex again before returning.
+     *
+     * `false` means the wait ran out; the mutex is held either way when this returns. The mutex must
+     * be held when this is called.
+     */
+    wait(self, m: Mutex, t: Timeout) -> bool = c_condvar_wait(self.handle, m.handle, t.raw) == 0
+
+    /** Wake one waiter, if there is one. */
+    signal(self) = c_condvar_signal(self.handle)
+
+    /** Wake every waiter. Each takes the mutex in turn, so they run one at a time. */
+    broadcast(self) = c_condvar_broadcast(self.handle)
+end Condvar
+
+/** A semaphore in storage you own, starting at `initial` and never exceeding `limit`.
+ *
+ * `None` where the storage is too small, where `limit` is zero, or where `initial` is above it.
+ * `semaphore(s, 0, 1)` is the binary semaphore an interrupt handler gives and a thread takes;
+ * `semaphore(s, n, n)` is a pool of `n` things.
+ */
+semaphore(storage: []long, initial: uint, limit: uint) -> Option[Semaphore]
+    if storage.len < sem_words then return None
+
+    val h: *SemControl = ptr_cast(as_mut_ptr(storage))
+
+    if c_sem_init(h, initial, limit) != 0 then return None
+
+    Some(Semaphore(h))
+end semaphore
+
+/** A view of the semaphore that is **already** in this storage, without initializing it.
+ *
+ * The constructors above initialize, which is right for the thread that creates an object and wrong
+ * for every other one: a second thread calling `semaphore` on the same storage would reset the count
+ * out from under whoever was waiting, and nothing would say so. This is how the other threads reach
+ * it -- and it is what `K_SEM_DEFINE` gives a C program for free, where every thread names one
+ * object.
+ *
+ * There is nothing to check beyond the size, so a view of storage that was never initialized is a
+ * kernel object full of whatever was there. Initialize before starting the threads that view it.
+ */
+semaphore_at(storage: []long) -> Option[Semaphore]
+    if storage.len < sem_words then return None
+
+    Some(Semaphore(ptr_cast(as_mut_ptr(storage))))
+
+/** A view of the mutex already in this storage. See `semaphore_at`. */
+mutex_at(storage: []long) -> Option[Mutex]
+    if storage.len < mutex_words then return None
+
+    Some(Mutex(ptr_cast(as_mut_ptr(storage))))
+
+/** A view of the condition variable already in this storage. See `semaphore_at`. */
+condvar_at(storage: []long) -> Option[Condvar]
+    if storage.len < condvar_words then return None
+
+    Some(Condvar(ptr_cast(as_mut_ptr(storage))))
+
+/** A mutex in storage you own, starting unlocked. `None` where the storage is too small. */
+mutex(storage: []long) -> Option[Mutex]
+    if storage.len < mutex_words then return None
+
+    val h: *MutexControl = ptr_cast(as_mut_ptr(storage))
+
+    if c_mutex_init(h) != 0 then return None
+
+    Some(Mutex(h))
+end mutex
+
+/** A condition variable in storage you own. `None` where the storage is too small. */
+condvar(storage: []long) -> Option[Condvar]
+    if storage.len < condvar_words then return None
+
+    val h: *CondvarControl = ptr_cast(as_mut_ptr(storage))
+
+    if c_condvar_init(h) != 0 then return None
+
+    Some(Condvar(h))
+end condvar
+
+private[zephyr] extern "syslZephyrSemInit" c_sem_init(s: *SemControl, initial: uint, limit: uint) -> int
+private[zephyr] extern "syslZephyrSemTake" c_sem_take(s: *SemControl, ticks: long) -> int
+private[zephyr] extern "syslZephyrSemGive" c_sem_give(s: *SemControl)
+private[zephyr] extern "syslZephyrSemReset" c_sem_reset(s: *SemControl)
+private[zephyr] extern "syslZephyrSemCount" c_sem_count(s: *SemControl) -> uint
+
+private[zephyr] extern "syslZephyrMutexInit" c_mutex_init(m: *MutexControl) -> int
+private[zephyr] extern "syslZephyrMutexLock" c_mutex_lock(m: *MutexControl, ticks: long) -> int
+private[zephyr] extern "syslZephyrMutexUnlock" c_mutex_unlock(m: *MutexControl) -> int
+
+private[zephyr] extern "syslZephyrCondvarInit" c_condvar_init(c: *CondvarControl) -> int
+private[zephyr] extern "syslZephyrCondvarSignal" c_condvar_signal(c: *CondvarControl) -> int
+private[zephyr] extern "syslZephyrCondvarBroadcast" c_condvar_broadcast(c: *CondvarControl) -> int
+
+private[zephyr] extern "syslZephyrCondvarWait" c_condvar_wait(c: *CondvarControl, m: *MutexControl,
+                                                              ticks: long) -> int

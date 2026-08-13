@@ -1,0 +1,174 @@
+module sh.sysl.zephyr
+
+@include("zephyr/autoconf.h")
+@include("zephyr/kernel.h")
+
+// Zephyr for sysl -- the clock, the timeout, and the scheduler.
+//
+// Nothing in this package is implemented here in the sense that matters: the kernel is the one your
+// build produced, every number below is measured out of *your* headers by the C compiler, and the
+// only C in the package is a file of trampolines. `package.hocon` says why it has to be that way,
+// and `sh/sysl/zephyr/zephyr.c` says why the trampolines exist.
+//
+// **`autoconf.h` comes first in every file here, and it is not decoration.** Zephyr force-includes
+// its generated Kconfig header into its own translation units with `-imacros`, a flag sysl has no
+// equivalent of. Without it every `CONFIG_*` the kernel headers test reads as absent, and the sizes
+// measured below would be the sizes of a kernel nobody built.
+//
+// The tick is the unit the whole API is written in, so it comes first.
+
+// What the kernel counts in, and the two tick values that are not durations at all.
+//
+// `forever_ticks` is `K_TICKS_FOREVER`, and it means *block* rather than *wait a very long time*:
+// the kernel tests for exactly this value. It is `-1` under both tick widths, which is what lets
+// this package pass a tick count where the kernel wants a `k_timeout_t` -- see `zephyr.c`.
+c const
+    ticks_per_sec: long = "CONFIG_SYS_CLOCK_TICKS_PER_SEC"
+    cycles_per_sec: long = "CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC"
+
+private[zephyr] c const
+    forever_ticks: long = "K_TICKS_FOREVER"
+
+/** How long to wait for something, which every blocking call in this package takes.
+ *
+ * It is a type rather than a number so that a tick count cannot be handed to a call that wanted
+ * milliseconds, which is the one mistake this API is otherwise shaped to invite. Build one with
+ * `msec`, `sec`, `usec` or `ticks_of`, and the two that are not durations with `forever` and
+ * `no_wait`.
+ *
+ * **It crosses to C as a tick count rather than as `k_timeout_t`.** The kernel's struct is eight
+ * bytes under `CONFIG_TIMEOUT_64BIT` and four without it, so a binding that mirrored the struct
+ * would fit one configuration; the trampoline builds the right one from this number. sysl passes a
+ * struct by value perfectly well -- that was measured before this package was written -- so this is
+ * about Zephyr's configurability rather than about a language limit.
+ */
+struct Timeout
+    private[zephyr] raw: long
+
+    /** The tick count, for a caller that wants to do arithmetic the constructors do not cover. */
+    ticks -> long = self.raw
+end Timeout
+
+/** Do not wait at all: take it if it is there, and answer immediately if it is not.
+ *
+ * This is `K_NO_WAIT`, and it is the only timeout an interrupt handler may use -- a handler has no
+ * thread to block.
+ */
+no_wait() -> Timeout = Timeout(0)
+
+/** Wait until it happens, however long that is. `K_FOREVER`. */
+forever() -> Timeout = Timeout(forever_ticks)
+
+/** A wait of exactly this many kernel ticks. */
+ticks_of(n: long) -> Timeout = Timeout(n)
+
+/** A wait of this many milliseconds, rounded **up** to whole ticks.
+ *
+ * Up rather than down, because a timeout is a promise not to give up early: on a 100 Hz tick,
+ * `msec(1)` is one tick rather than none. It is the rounding `K_MSEC` itself does.
+ */
+msec(ms: long) -> Timeout = Timeout(c_ms_to_ticks(ms))
+
+/** A wait of this many seconds. */
+sec(s: long) -> Timeout = Timeout(c_ms_to_ticks(s * 1000))
+
+/** A wait of this many microseconds, rounded up. Shorter than a tick becomes one tick. */
+usec(us: long) -> Timeout = Timeout(c_us_to_ticks(us))
+
+/** How many milliseconds a tick count is, rounded down. The inverse of `msec`, near enough. */
+ticks_to_msec(t: long) -> long = c_ticks_to_ms(t)
+
+/** Give up the processor for a while, answering the milliseconds left if something woke it early.
+ *
+ * Zero is the ordinary answer -- the sleep ran to its end. Anything else means `wakeup` was called
+ * on this thread, and the number is how much of the sleep was not slept. `sleep(forever())` suspends
+ * until somebody wakes it.
+ *
+ * **A sleep is not a delay loop.** The thread is off the run queue for the duration and the
+ * processor goes to whatever else is ready, which is the whole reason to have a kernel. `busy_wait`
+ * is the other thing, and it is for waits far shorter than a tick.
+ */
+sleep(t: Timeout) -> i32 = c_sleep(t.raw)
+
+/** Spin for this many microseconds without giving the processor up.
+ *
+ * For a hardware delay too short to be worth a context switch -- a reset pulse, a bus settling time.
+ * It does not yield, so nothing else runs; a millisecond spent here is a millisecond stolen from
+ * every other thread.
+ */
+busy_wait(us: u32) = c_busy_wait(us)
+
+/** Milliseconds since the kernel started. Monotonic, and 64 bits, so it does not wrap. */
+uptime() -> long = c_uptime_ms()
+
+/** Ticks since the kernel started, which is the same clock without the division. */
+uptime_ticks() -> long = c_uptime_ticks()
+
+/** The hardware cycle counter, which is the finest clock the board has and **does** wrap.
+ *
+ * `cycles_per_sec` is what to divide by. Compare two readings by subtraction rather than by
+ * ordering, since the difference is right across a wrap and `now >= then` is not.
+ */
+cycles() -> u32 = c_cycle_get_32()
+
+/** Offer the processor to any thread of the same priority that is ready. */
+yield_now() = c_yield()
+
+/** Whether a `yield` here would be legal: false in an interrupt handler and before the kernel runs. */
+can_yield() -> bool = c_can_yield()
+
+/** Whether this code is running in an interrupt handler.
+ *
+ * The thing to ask before doing something that blocks. A handler that calls `take(forever())` does
+ * not wait -- it faults the kernel, because there is no thread to suspend.
+ */
+in_isr() -> bool = c_in_isr()
+
+/** Whether the current thread can be preempted by another of the same priority. */
+is_preemptible() -> bool = c_is_preempt_thread()
+
+/** Whether the kernel is not running yet, which is where a `SYS_INIT` hook finds itself. */
+before_kernel() -> bool = c_is_pre_kernel()
+
+/** Stop preemption without disabling interrupts, and let it resume.
+ *
+ * The cheaper of the two ways to make a sequence atomic against *other threads*: interrupts still
+ * run, so it protects nothing against a handler. It nests -- preemption resumes when the outermost
+ * `sched_unlock` runs.
+ *
+ * **Nothing that blocks may be called in between**, which is every function here taking a `Timeout`.
+ */
+sched_lock() = c_sched_lock()
+
+sched_unlock() = c_sched_unlock()
+
+/** Put the processor into its idle state until an interrupt arrives.
+ *
+ * Almost nothing should call this: Zephyr's own idle thread does it, and a program that does it
+ * instead has usually reinvented `sleep(forever())` with worse latency.
+ */
+cpu_idle() = c_cpu_idle()
+
+// The trampolines. Every one of them is in `zephyr.c`, and that file says at length why a package
+// cannot simply declare the names Zephyr documents.
+
+private[zephyr] extern "syslZephyrMsToTicks" c_ms_to_ticks(ms: long) -> long
+private[zephyr] extern "syslZephyrUsToTicks" c_us_to_ticks(us: long) -> long
+private[zephyr] extern "syslZephyrTicksToMs" c_ticks_to_ms(t: long) -> long
+
+private[zephyr] extern "syslZephyrSleep" c_sleep(ticks: long) -> i32
+private[zephyr] extern "syslZephyrBusyWait" c_busy_wait(us: u32)
+
+private[zephyr] extern "syslZephyrUptimeTicks" c_uptime_ticks() -> long
+private[zephyr] extern "syslZephyrUptimeMs" c_uptime_ms() -> long
+private[zephyr] extern "syslZephyrCycleGet32" c_cycle_get_32() -> u32
+
+private[zephyr] extern "syslZephyrYield" c_yield()
+private[zephyr] extern "syslZephyrCanYield" c_can_yield() -> bool
+private[zephyr] extern "syslZephyrIsInIsr" c_in_isr() -> bool
+private[zephyr] extern "syslZephyrIsPreemptThread" c_is_preempt_thread() -> bool
+private[zephyr] extern "syslZephyrIsPreKernel" c_is_pre_kernel() -> bool
+
+private[zephyr] extern "syslZephyrSchedLock" c_sched_lock()
+private[zephyr] extern "syslZephyrSchedUnlock" c_sched_unlock()
+private[zephyr] extern "syslZephyrCpuIdle" c_cpu_idle()

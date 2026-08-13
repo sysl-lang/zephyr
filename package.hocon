@@ -1,0 +1,92 @@
+// Zephyr for sysl -- the kernel API: threads, semaphores, mutexes, condition variables, events,
+// message queues, stacks, pipes, timers, work queues, slabs and heaps.
+//
+// This is the block a *consumer* writes to reach this package:
+//
+//     dependencies {
+//       zephyr { git = "github.com/sysl-lang/zephyr", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is a
+// tag `v0.1.0` on this repository. `--lib` still works and is what a checkout beside you is for.
+
+// `name` is the package; the module a program imports is `sh.sysl.zephyr`, and the two are
+// deliberately different. The module carries the `sh.sysl.` prefix so that no package claims a
+// top-level word another one might want; the package name is the short one, because it names this
+// repository rather than a namespace.
+
+package {
+  name    = "zephyr"
+  version = "0.1.0"
+}
+
+// **Zephyr owns the build, and that is the one structural fact everything else follows from.**
+//
+// It is not a library you link against. It is CMake plus Kconfig plus devicetree plus `west`: the
+// configuration decides what the kernel *is*, a generated header supplies every `CONFIG_*` the
+// headers test, a second generated header lists the syscalls, and the final link is driven by a
+// linker script the build wrote. None of that fits inside something `sysl build` fetches.
+//
+// So the arrangement is the other way up, exactly as `pico2` does it for the pico-sdk: **a program
+// using this package is built with `sysl build-c` into a static archive, and Zephyr's CMake links
+// it.** A plain `sysl build` will compile it happily and then fail to link. `README.md` carries the
+// `CMakeLists.txt` that does it, and every line in that file is there because leaving it out fails
+// silently or fails misleadingly.
+//
+// What keeps the binding honest is `c const`: every struct size, every alignment, the tick rate and
+// `K_TICKS_FOREVER` are measured out of *your* build's headers by the C compiler on every build,
+// rather than transcribed here. An `@assert` beside each one refuses a configuration this package
+// cannot bind, instead of letting a program misread a kernel object at run time.
+
+requires {
+
+  // Three, because a consumer knows three separate things and no one of them can be derived from
+  // another: where Zephyr is, where *this build* put its generated headers, and where the C
+  // library's headers are. A named include path is one directory, so a repeated name would
+  // overwrite rather than accumulate.
+  //
+  // A triple-quoted HOCON string is raw, so a '\' at the end of a line stays in the text and turns
+  // up in the diagnostic. These are one line each for that reason, however long the line is.
+  headers {
+    zephyr = "the Zephyr tree's own 'include' directory, the one holding 'zephyr/kernel.h' -- CMake knows it as ${ZEPHYR_BASE}/include"
+
+    zephyr-generated = "the generated headers THIS build wrote, holding 'zephyr/autoconf.h' and 'zephyr/syscall_list.h' -- it is <build>/zephyr/include/generated, and it does not exist until the build has run, so a sysl step that reads it must depend on 'syscall_list_h_target'"
+
+    libc = "the C library headers your toolchain supplies, the ones behind 'zephyr/types.h' -- for the GNU Arm toolchain it is what 'arm-none-eabi-gcc -print-sysroot' answers, with '/include' on the end"
+  }
+}
+
+// **The heap is Zephyr's**, which is what `packages.md § 13` is for. Every allocation the whole
+// program emits -- a string concatenation, a `Buf` growing, a box the reference counter builds --
+// goes to `k_malloc`, and every release to `k_free`.
+//
+// It has to, because a program has one heap. Zephyr's `k_malloc` allocates out of the kernel's own
+// pool with the scheduler's locking, so it is safe to call from two threads; a libc `malloc` linked
+// beside it is a second heap with its own locking rules, and a mixed pair would link cleanly and
+// hand one allocator's storage to the other's `free` at run time. That is the failure this block
+// exists to prevent.
+//
+// **The cost, stated rather than hidden:** `k_malloc` needs `CONFIG_HEAP_MEM_POOL_SIZE` to be
+// something other than zero, and it is zero by default on many boards. A program that allocates
+// gets a null back and panics; a program that allocates nothing never references the pair, so
+// `@no_alloc` is how a fully static application says so up front and pays nothing for this line.
+allocator {
+  alloc = "k_malloc"
+  free  = "k_free"
+}
+
+// **There is deliberately no capability under `requires`.** The tempting one is `threads`, and it is
+// wrong twice over: `capabilities.md` makes it a property the *target* offers, gating `sysl.thread`
+// specifically, and a package cannot make its target offer one. Declaring it would refuse this
+// package on precisely the freestanding targets it exists for.
+//
+// Nothing else fits either. This package opens no file, reads no clock and asks an operating system
+// for nothing -- the kernel it binds *is* the thing that would have provided those. `heap` is not
+// declared for the same reason the block above exists: the heap is named rather than assumed.
+//
+// What a reader does need to know is that `06`'s crossing rules are language rules and bind a
+// Zephyr thread exactly as they bind anything else that creates a domain. A plain `&T` may not cross
+// into a thread -- its count is not atomic, which is the race the whole model exists to prevent.
+// `&sync T` is the spelling that may, and `sysl.sync`'s `Atomic` and `SpinLock` need no capability
+// and are already reachable on a bare machine. README.md says this at length, because it is the one
+// thing here that a person can get wrong quietly.

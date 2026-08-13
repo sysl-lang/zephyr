@@ -1,0 +1,113 @@
+module sh.sysl.zephyr
+
+@include("zephyr/autoconf.h")
+@include("zephyr/kernel.h")
+
+import sysl.slices.{as_mut_ptr, as_ptr}
+
+// Message queues: a ring of fixed-size messages, copied in and copied out.
+//
+// **Copied, which is the point.** A queue of pointers hands the receiver something the sender still
+// owns, and on a kernel with no allocator there is usually nowhere for that something to live. A
+// message queue takes `size` bytes out of the sender's storage and puts `size` bytes into the
+// receiver's, so the two threads share nothing at all once the call returns.
+//
+// It needs **two** pieces of storage: the control block, like every kernel object here, and the ring
+// buffer the messages sit in, which is `max_msgs * msg_size` bytes and is yours to declare.
+//
+//     var q_control: [msgq_words]long = [0; msgq_words]
+//     var q_buffer: [4 * 8]u8 = [0; 4 * 8]
+//
+//     val q = message_queue(q_control[..], q_buffer[..], 8, 4).unwrap
+
+// What the kernel calls a message queue. Only ever held by pointer.
+opaque struct MsgqControl
+
+/** How many `long`s a message queue's control block needs. */
+c const
+    msgq_words: usize = "(sizeof(struct k_msgq) + sizeof(int64_t) - 1) / sizeof(int64_t)"
+
+private[zephyr] c const
+    msgq_align: usize = "__alignof__(struct k_msgq)"
+
+@assert(alignof(long) >= msgq_align,
+        "a 'struct k_msgq' on this configuration wants a stronger alignment than an array of 'long' gives — sh.sysl.zephyr cannot lay one into caller storage")
+
+// A queue of fixed-size messages between threads.
+struct MessageQueue
+    private[zephyr] handle: *MsgqControl
+    private[zephyr] size: usize
+
+    /** Put a message at the back, waiting up to `t` for room. `false` means the queue stayed full.
+     *
+     * `msg` must be at least `msg_size` bytes; the bytes past that are not read. A message put with
+     * `no_wait()` from an interrupt handler is the ordinary way to hand work to a thread.
+     */
+    put(self, msg: []const u8, t: Timeout) -> bool
+        if msg.len < self.size then return false
+
+        c_msgq_put(self.handle, as_ptr(msg), t.raw) == 0
+    end put
+
+    /** Take the message at the front, waiting up to `t` for one. `false` means none arrived.
+     *
+     * `into` must be at least `msg_size` bytes, and exactly that many are written.
+     */
+    get(self, into: []u8, t: Timeout) -> bool
+        if into.len < self.size then return false
+
+        c_msgq_get(self.handle, as_mut_ptr(into), t.raw) == 0
+    end get
+
+    /** Copy the front message without removing it. `false` if the queue is empty. */
+    peek(self, into: []u8) -> bool
+        if into.len < self.size then return false
+
+        c_msgq_peek(self.handle, as_mut_ptr(into)) == 0
+    end peek
+
+    /** Throw away every message, and fail every thread waiting to `get` one. */
+    purge(self) = c_msgq_purge(self.handle)
+
+    /** How many messages are waiting, and how many more will fit. */
+    used -> u32 = c_msgq_used(self.handle)
+
+    free -> u32 = c_msgq_free(self.handle)
+
+    /** How many bytes one message is, which is what `put` and `get` copy. */
+    msg_size -> usize = self.size
+end MessageQueue
+
+/** A message queue in storage you own: `control` for the kernel object, `buffer` for the messages.
+ *
+ * `None` where the control block is too small, where `msg_size` or `max_msgs` is zero, or where the
+ * buffer is smaller than `msg_size * max_msgs` -- which is the check worth having, since getting it
+ * wrong writes past the end of an array on the first message that wraps.
+ */
+message_queue(control: []long, buffer: []u8, msg_size: usize, max_msgs: u32) -> Option[MessageQueue]
+    if control.len < msgq_words || msg_size == 0 || max_msgs == 0 then return None
+    if buffer.len < msg_size * usize(max_msgs) then return None
+
+    val h: *MsgqControl = ptr_cast(as_mut_ptr(control))
+
+    c_msgq_init(h, as_mut_ptr(buffer), msg_size, max_msgs)
+
+    Some(MessageQueue(h, msg_size))
+end message_queue
+
+/** A view of the message queue already in this storage, for another thread. See `semaphore_at`. */
+message_queue_at(control: []long, msg_size: usize) -> Option[MessageQueue]
+    if control.len < msgq_words then return None
+
+    Some(MessageQueue(ptr_cast(as_mut_ptr(control)), msg_size))
+
+private[zephyr] extern "syslZephyrMsgqInit" c_msgq_init(q: *MsgqControl, buffer: *u8,
+                                                        msg_size: usize, max_msgs: u32)
+
+private[zephyr] extern "syslZephyrMsgqPut" c_msgq_put(q: *MsgqControl, data: *u8, ticks: long) -> int
+
+private[zephyr] extern "syslZephyrMsgqGet" c_msgq_get(q: *MsgqControl, data: *u8, ticks: long) -> int
+private[zephyr] extern "syslZephyrMsgqPeek" c_msgq_peek(q: *MsgqControl, data: *u8) -> int
+private[zephyr] extern "syslZephyrMsgqPurge" c_msgq_purge(q: *MsgqControl)
+private[zephyr] extern "syslZephyrMsgqNumUsed" c_msgq_used(q: *MsgqControl) -> u32
+private[zephyr] extern "syslZephyrMsgqNumFree" c_msgq_free(q: *MsgqControl) -> u32
