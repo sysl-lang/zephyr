@@ -75,10 +75,12 @@ allocator {
   free  = "k_free"
 }
 
-// **There is deliberately no capability under `requires`.** The tempting one is `threads`, and it is
-// wrong twice over: `capabilities.md` makes it a property the *target* offers, gating `sysl.thread`
-// specifically, and a package cannot make its target offer one. Declaring it would refuse this
-// package on precisely the freestanding targets it exists for.
+// **There is deliberately no capability under `requires`.** The tempting one used to be `threads`,
+// and as of sysl 0.0.51 there is no such capability to declare: a capability says what the *target*
+// offers, and a kernel a package binds is not that. A machine running Zephyr has threads and no
+// POSIX, never reaches the library module that needed the gate, and binds its kernel here -- so no
+// capability could have made `pthread_create` appear on it. What survives is `posix`, which gates
+// `sysl.posix.threads` and which this package neither offers nor wants.
 //
 // Nothing else fits either. This package opens no file, reads no clock and asks an operating system
 // for nothing -- the kernel it binds *is* the thing that would have provided those. `heap` is not
