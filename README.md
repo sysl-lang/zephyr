@@ -40,11 +40,11 @@ That is a whole program. There is no C in it, and none in the project that build
 
 ```hocon
 dependencies {
-  zephyr { git = "github.com/sysl-lang/zephyr", version = "0.1.0" }
+  zephyr { git = "github.com/sysl-lang/zephyr", version = "0.2.0" }
 }
 ```
 
-`sysl-lang/zephyr-demo` is a worked example and is also this package's test suite — 67 checks against
+`sysl-lang/zephyr-demo` is a worked example and is also this package's test suite — 70 checks against
 the real kernel under QEMU.
 
 ## Zephyr owns the build, and everything here follows from that
@@ -111,10 +111,37 @@ cross into one** — its count is not atomic, which is the race the whole model 
 `&sync T` is the spelling that may, and `sysl.sync`'s `Atomic` and `SpinLock` need no capability and
 are already reachable on a bare machine.
 
-`thread`'s three `*u8` arguments are the kernel's own `void *` parameters and are the one hole this
-package cannot close: a pointer cast to `*u8` has lost the type that would have said whether sharing
-it was safe. It is the same hole `k_thread_create` has in C, and the same one FreeRTOS's `pvParameters`
-has.
+**As of 0.2.0 the compiler says that, rather than this paragraph.** `thread` is generic in its three
+arguments and marked `@crossing(p1, p2, p3)`, so each is walked at every call:
+
+```
+error: what 'p1' of 'sh.sysl.zephyr.thread' points at reaches another concurrency domain, so every
+count inside it has to be atomic — but its 'c' reaches a '&app.Cell', whose count is not. Hold it as
+a '&sync app.Cell' ('06')
+```
+
+**Those three were `*u8` until 0.2.0, and that is why this release breaks a caller.** A `*u8` is what
+`k_thread_create` takes and it has thrown the pointee away, so the walk found a byte and passed
+whatever was handed over — the annotation was unwritable here for exactly that reason. The types stay
+on this signature and are cast away on the way out, so the kernel gets what it always got.
+
+`A`, `B` and `C` are read off the body, so a caller writes no more than it did:
+
+```sysl
+worker(cfg: *Config, q: *u8, p3: *u8) = ...
+
+thread(control[..], stack[..], &worker, &cfg, no_arg, no_arg, 5, no_wait(), no_options)
+```
+
+Three type parameters rather than one, because the kernel's three arguments are unrelated and one
+parameter would insist they were the same type.
+
+Two things change for a caller that was already there. A body written `(a: *u8, b: *u8, c: *u8)` with
+casts beside it still compiles and still says nothing — **type the body and the casts go away.** And
+**`null` can no longer be written at a `thread` call**: it takes its type from its context, and the
+context is the `*T` being inferred, so there is none. `no_arg` is the constant to write instead.
+
+`spawn` is unchanged and carries no annotation, because it hands the thread nothing to check.
 
 ## The surface
 
@@ -224,9 +251,11 @@ package's tests live in `sysl-lang/zephyr-demo` and run under QEMU.
 
 ## Needs
 
-sysl **0.0.47** or newer, a Zephyr workspace, and a bare-metal Arm toolchain. The Zephyr SDK is not
-required — `arm-none-eabi-gcc` with `ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb` is what this was built and
-tested with.
+sysl **0.0.52** or newer, which is the release that added `@crossing`; a Zephyr workspace; and a
+bare-metal Arm toolchain. The Zephyr SDK is not required — `arm-none-eabi-gcc` with
+`ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb` is what this was built and tested with.
+
+0.1.0 is the last version that builds on an older sysl, and its `thread` takes three `*u8`.
 
 ## Licence
 

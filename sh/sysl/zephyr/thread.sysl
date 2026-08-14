@@ -37,8 +37,29 @@ import sysl.slices.{as_mut_ptr, as_ptr}
 // that returns is a scheduler walking freed memory.
 //
 // A word about what may cross into one: `06`'s rules are the language's and a Zephyr thread is an
-// ordinary domain. A plain `&T` may not go, because its count is not atomic; `&sync T` may. Nothing
-// in this package relaxes that, and nothing in it can.
+// ordinary domain. A plain `&T` may not go, because its count is not atomic; `&sync T` may.
+//
+// **`thread` is generic in its three arguments and marked `@crossing(p1, p2, p3)`, so the compiler
+// says that rather than this comment.** The kernel's parameters are three `void *` and this package's
+// were three `*u8`, which made the annotation useless: the walk that looks through a pointer would
+// have found a byte and passed. Keeping `A`, `B` and `C` on the signature is what gives it something
+// to walk, and they are read off the body, so a caller writes no more than it did.
+//
+// Three type parameters rather than one, because the kernel's three arguments are unrelated -- a
+// thread handed a config, a queue and a log sink is the ordinary case, and one parameter would insist
+// they were the same type. Each is walked on its own.
+
+/** The address to hand a thread that is given nothing, which is the kernel's own `NULL` argument.
+ *
+ * **`null` cannot be written at a `thread` call, and that is the language rather than this package.**
+ * A bare `null` takes its type from its context, and the context at a `@crossing` parameter is the
+ * `*T` being inferred -- so it has none, and the compiler says so. A named constant of a concrete
+ * type settles that parameter at `u8` and reads better than the `null` it replaces: it says *this
+ * argument is unused* rather than *this argument is a null pointer*.
+ *
+ * `spawn` is the shorter way to say it three times.
+ */
+val no_arg: *u8 = ptr_cast(0usize)
 
 // What the kernel calls a thread. Only ever held by pointer; `k_tid_t` is exactly this.
 opaque struct ThreadControl
@@ -127,11 +148,16 @@ end Thread
  * thread entry is a C function pointer and a closure has no address. Write `&worker`, not `worker` --
  * the bare name is the capture-free closure and the compiler will say so.
  *
+ * Nothing crosses, so there is no `@crossing` here and none is wanted: a thread handed three nulls
+ * shares nothing, and whatever it reads out of module storage is shared by being module storage
+ * rather than by being passed. `thread` is the one that carries an argument and the one that is
+ * checked.
+ *
  * `None` where either piece of storage is too small.
  */
 spawn(control: []long, stack: []u8, body: *extern(*u8, *u8, *u8) -> unit,
       prio: int) -> Option[Thread] =
-    thread(control, stack, body, null, null, null, prio, no_wait(), no_options)
+    thread(control, stack, body, no_arg, no_arg, no_arg, prio, no_wait(), no_options)
 
 /** Create a thread, in full: three arguments, a start delay and the option bits.
  *
@@ -139,21 +165,27 @@ spawn(control: []long, stack: []u8, body: *extern(*u8, *u8, *u8) -> unit,
  * priority is higher than the caller's. `forever()` creates it stopped, for `start` to release
  * later.
  *
- * The three `*u8` arguments are the kernel's own `void *` parameters and are passed through
- * untouched. **They are the one hole in the language's crossing rules that this package cannot
- * close**, exactly as the same three are in FreeRTOS: a pointer cast to `*u8` has lost the type that
- * would have told the compiler whether it was safe to share.
+ * The three arguments are the kernel's own `void *` parameters and are passed through untouched --
+ * but their types stay on this signature, and `@crossing(p1, p2, p3)` is what that buys: each is
+ * walked at the call, and a state holding a plain `&T` is refused with the `&sync T` it should have
+ * been. Until 0.2.0 they were three `*u8`, which is what the kernel gets and what the compiler could
+ * say nothing about.
+ *
+ * `no_arg` is what a thread that is handed nothing carries. A bare `null` cannot be written at these
+ * calls: it takes its type from its context, and the context is a `*T` being inferred.
  *
  * `None` where either piece of storage is too small.
  */
-thread(control: []long, stack: []u8, body: *extern(*u8, *u8, *u8) -> unit,
-       p1: *u8, p2: *u8, p3: *u8, prio: int, delay: Timeout, options: u32) -> Option[Thread]
+@crossing(p1, p2, p3)
+thread[A, B, C](control: []long, stack: []u8, body: *extern(*A, *B, *C) -> unit,
+                p1: *A, p2: *B, p3: *C, prio: int, delay: Timeout,
+                options: u32) -> Option[Thread]
     if control.len < thread_words || stack.len == 0 then return None
 
     val h: *ThreadControl = ptr_cast(as_mut_ptr(control))
 
-    val tid = c_thread_create(h, as_mut_ptr(stack), stack.len, body, p1, p2, p3,
-                              prio, options, delay.raw)
+    val tid = c_thread_create(h, as_mut_ptr(stack), stack.len, ptr_cast(body), ptr_cast(p1),
+                              ptr_cast(p2), ptr_cast(p3), prio, options, delay.raw)
 
     if tid == null then None else Some(Thread(tid))
 end thread

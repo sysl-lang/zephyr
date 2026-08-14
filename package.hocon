@@ -4,11 +4,11 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       zephyr { git = "github.com/sysl-lang/zephyr", version = "0.1.0" }
+//       zephyr { git = "github.com/sysl-lang/zephyr", version = "0.2.0" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is a
-// tag `v0.1.0` on this repository. `--lib` still works and is what a checkout beside you is for.
+// tag `v0.2.0` on this repository. `--lib` still works and is what a checkout beside you is for.
 
 // `name` is the package; the module a program imports is `sh.sysl.zephyr`, and the two are
 // deliberately different. The module carries the `sh.sysl.` prefix so that no package claims a
@@ -17,7 +17,7 @@
 
 package {
   name    = "zephyr"
-  version = "0.1.0"
+  version = "0.2.0"
 }
 
 // **Zephyr owns the build, and that is the one structural fact everything else follows from.**
@@ -90,5 +90,10 @@ allocator {
 // Zephyr thread exactly as they bind anything else that creates a domain. A plain `&T` may not cross
 // into a thread -- its count is not atomic, which is the race the whole model exists to prevent.
 // `&sync T` is the spelling that may, and `sysl.sync`'s `Atomic` and `SpinLock` need no capability
-// and are already reachable on a bare machine. README.md says this at length, because it is the one
-// thing here that a person can get wrong quietly.
+// and are already reachable on a bare machine.
+//
+// **As of 0.2.0 that is a refusal rather than a warning**, and it is why this release breaks a
+// caller. `thread` is generic in its three arguments and is marked `@crossing(p1, p2, p3)`, so each
+// is walked at the call; they were three `*u8` before, and a `*u8` has thrown the pointee away, so
+// there was nothing for the walk to look at. README.md says what changes for a caller -- a typed
+// body, and `no_arg` where `null` used to be written.
