@@ -31,8 +31,11 @@
  * forever after the cast.
  *
  * `autoconf.h` is included explicitly. Zephyr force-includes it into its own translation units with
- * `-imacros`, which is a flag sysl has no equivalent of, and without it every `CONFIG_*` the kernel
- * headers test reads as absent.
+ * `-imacros`, and without it every `CONFIG_*` the kernel headers test reads as absent. This used to
+ * say sysl had no equivalent of that flag; since 0.0.90 `SYSL_EXTRA_CFLAGS` reaches every clang the
+ * build drives, so it could carry one. Naming the header here is still right -- that variable
+ * belongs to the whole build, and a consumer who forgot it would measure a kernel nobody built
+ * rather than fail.
  */
 
 #include <zephyr/autoconf.h>

@@ -11,9 +11,15 @@ module sh.sysl.zephyr
 // and `sh/sysl/zephyr/zephyr.c` says why the trampolines exist.
 //
 // **`autoconf.h` comes first in every file here, and it is not decoration.** Zephyr force-includes
-// its generated Kconfig header into its own translation units with `-imacros`, a flag sysl has no
-// equivalent of. Without it every `CONFIG_*` the kernel headers test reads as absent, and the sizes
-// measured below would be the sizes of a kernel nobody built.
+// its generated Kconfig header into its own translation units with `-imacros`. Without it every
+// `CONFIG_*` the kernel headers test reads as absent, and the sizes measured below would be the
+// sizes of a kernel nobody built.
+//
+// This used to add "a flag sysl has no equivalent of", which stopped being true at sysl 0.0.90:
+// `SYSL_EXTRA_CFLAGS` is spliced into every clang the build drives, so `-imacros` can be put on the
+// line. **Naming the header here is still the right shape**, because that variable is the whole
+// build's and this is one package's requirement -- a consumer who forgot to set it would get a
+// kernel measured wrong rather than a build that stopped.
 //
 // The tick is the unit the whole API is written in, so it comes first.
 
